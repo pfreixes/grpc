@@ -33,6 +33,16 @@ typedef struct {
   grpc_completion_queue* cq;
 } child_events;
 
+struct callback_context {
+  grpc_experimental_completion_queue_functor functor;
+  bool done;
+  callback_context(void (*cb)(
+      grpc_experimental_completion_queue_functor* functor, int success))
+      : done(false) {
+    functor.functor_run = cb;
+  }
+};
+
 static void child_thread(void* arg) {
   child_events* ce = static_cast<child_events*>(arg);
   grpc_event ev;
@@ -163,9 +173,62 @@ static void test_connectivity(grpc_end2end_test_config config) {
   cq_verifier_destroy(cqv);
 }
 
+static void cb_watch_connectivity(
+    grpc_experimental_completion_queue_functor* functor, int success) {
+  callback_context* cb_ctx = (callback_context*)functor;
+
+  gpr_log(GPR_DEBUG, "cb_watch_connectivity called, verifying");
+
+  /* callback must not have errors */
+  GPR_ASSERT(success != 0);
+
+  cb_ctx->done = true;
+}
+
+static void cb_shutdown(grpc_experimental_completion_queue_functor* functor,
+                        int success) {
+  gpr_log(GPR_DEBUG, "cb_shutdown called, nothing to do");
+}
+
+static void test_watch_connectivity_cq_callback(
+    grpc_end2end_test_config config) {
+  grpc_experimental_completion_queue_functor shutdown_functor;
+  callback_context cb_ctx(cb_watch_connectivity);
+  grpc_completion_queue* cq;
+  grpc_end2end_test_fixture f = config.create_fixture(nullptr, nullptr);
+
+  config.init_client(&f, nullptr);
+
+  shutdown_functor.functor_run = cb_shutdown;
+
+  /* start connecting */
+  grpc_channel_check_connectivity_state(f.client, 1);
+
+  /* create the cq callback */
+  cq = grpc_completion_queue_create_for_callback(&shutdown_functor, nullptr);
+
+  /* start watching for any change, cb is immediately called
+   * and no dead lock should be raised */
+  grpc_channel_watch_connectivity_state(f.client, GRPC_CHANNEL_IDLE,
+                                        grpc_timeout_seconds_to_deadline(3), cq,
+                                        &cb_ctx.functor);
+
+  /* we just check that the callback was executed once notifying the transition
+   * from GRPC_CHANNEL_IDLE to GRPC_CHANNEL_TRANSIENT_FAILURE or
+   * GRPC_CHANNEL_CONNECTING, so there was no dead lock. */
+  GPR_ASSERT(cb_ctx.done == true);
+
+  /* cleanup */
+  grpc_channel_destroy(f.client);
+  grpc_completion_queue_shutdown(cq);
+  grpc_completion_queue_destroy(cq);
+  config.tear_down_data(&f);
+}
+
 void connectivity(grpc_end2end_test_config config) {
   GPR_ASSERT(config.feature_mask & FEATURE_MASK_SUPPORTS_DELAYED_CONNECTION);
   test_connectivity(config);
+  test_watch_connectivity_cq_callback(config);
 }
 
 void connectivity_pre_init(void) {}
